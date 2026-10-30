@@ -300,15 +300,6 @@ def records_book(con, league_id=None, season=None, limit=10) -> dict:
     reg = g[g["is_regular_season"] == 1]
     top = reg.loc[reg.groupby(key)["points_for"].idxmax()] if not reg.empty else reg
     low = reg.loc[reg.groupby(key)["points_for"].idxmin()] if not reg.empty else reg
-    owners = sorted(g["owner"].dropna().unique().tolist(), key=str.casefold)
-
-    def scorer_counts(scored, count_name, never_emoji):
-        counts = scored.groupby("owner").size().reindex(owners, fill_value=0)
-        out = counts.rename(count_name).rename_axis("owner").reset_index()
-        never = out[count_name] == 0
-        out.loc[never, "owner"] = out.loc[never, "owner"] + f" {never_emoji}"
-        return out.sort_values([count_name, "owner"], ascending=[False, True], kind="stable").reset_index(drop=True)
-
     wins = g[g["win"] == 1].copy()
     wins["margin"] = (wins["points_for"] - wins["points_against"]).round(1)
     wins = wins.rename(columns={"owner": "winner", "team_name": "winner_team", "opponent": "loser",
@@ -317,8 +308,10 @@ def records_book(con, league_id=None, season=None, limit=10) -> dict:
     margin_cols = ["league_id", "team_id", "league_name", "season", "week", "stage", "winner", "winner_team",
                    "winner_score", "loser", "loser_team", "loser_score", "margin"]
     return {
-        "top_scorer_weeks": scorer_counts(top, "weeks_as_top_scorer", "💀"),
-        "low_scorer_weeks": scorer_counts(low, "weeks_as_low_scorer", "👑"),
+        "top_scorer_weeks": top.groupby("owner").size().rename("weeks_as_top_scorer")
+                               .sort_values(ascending=False).reset_index(),
+        "low_scorer_weeks": low.groupby("owner").size().rename("weeks_as_low_scorer")
+                               .sort_values(ascending=False).reset_index(),
         "highest_scores": g.nlargest(limit, "points_for")[score_cols].reset_index(drop=True),
         "lowest_scores": g.nsmallest(limit, "points_for")[score_cols].reset_index(drop=True),
         "blowouts": wins.nlargest(limit, "margin")[margin_cols].reset_index(drop=True),

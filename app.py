@@ -38,39 +38,22 @@ if _stale:
              "then stop the app (Ctrl+C) and start it again with: streamlit run app.py")
     st.stop()
 
-@st.cache_resource
-def _initialize_database_once(db_file: str, viewer_mode: bool) -> tuple[int, int, str | None]:
-    """Initialize and clean the database once; Streamlit reruns this script on every interaction."""
-    init_con = db.connect()
-    try:
-        # The hosted copy normally relies on the views already being in the published database.
-        if not viewer_mode or not init_con.execute(
-            "SELECT 1 FROM sqlite_master WHERE name = 'games'"
-        ).fetchone():
-            db.init_db(init_con)
-        removed_weeks, renamed_rows, cleanup_error = 0, 0, None
-        if not viewer_mode:
-            try:
-                from owner_names import normalize_owner_names
-                removed_weeks = db.repair_duplicate_weeks(init_con)
-                renamed_rows = normalize_owner_names(init_con)
-            except Exception as e:
-                cleanup_error = str(e)
-        return removed_weeks, renamed_rows, cleanup_error
-    finally:
-        init_con.close()
-
-
-removed_weeks, renamed_rows, cleanup_error = _initialize_database_once(
-    str(db.db_path().resolve()), VIEWER
-)
 con = db.connect()
-if not VIEWER and (removed_weeks or renamed_rows):
-    st.sidebar.info(f"Cleaned up your data: removed {removed_weeks} duplicated week(s), "
-                    f"merged {renamed_rows} owner name(s). Re-publish to update the hosted copy.")
-if not VIEWER and cleanup_error and not st.session_state.get("cleanup_warning_shown"):
-    st.sidebar.warning(f"Data cleanup skipped: {cleanup_error}")
-    st.session_state.cleanup_warning_shown = True
+# The hosted copy never writes to the database; it relies on the views already being in the file.
+if not VIEWER or not con.execute("SELECT 1 FROM sqlite_master WHERE name = 'games'").fetchone():
+    db.init_db(con)
+
+# Tidy existing data on your own PC: drop weeks ESPN repeated after a season ended, merge duplicate owners.
+if not VIEWER:
+    try:
+        from owner_names import normalize_owner_names
+        removed_weeks = db.repair_duplicate_weeks(con)
+        renamed_rows = normalize_owner_names(con)
+        if removed_weeks or renamed_rows:
+            st.sidebar.info(f"Cleaned up your data: removed {removed_weeks} duplicated week(s), "
+                            f"merged {renamed_rows} owner name(s). Re-publish to update the hosted copy.")
+    except Exception as e:  # never let tidying block the app
+        st.sidebar.warning(f"Data cleanup skipped: {e}")
 
 # ---- sync controls ----
 last_sync = metrics.q(con, "SELECT value FROM meta WHERE key = 'last_sync'")
@@ -133,13 +116,6 @@ else:
     st.sidebar.caption("The filters apply to every page except SQL and Ask.")
 
 owners = metrics.q(con, "SELECT DISTINCT owner FROM teams ORDER BY owner")["owner"].tolist()
-try:
-    from owner_names import hidden_profiles, name_key
-    hidden_profile_keys = hidden_profiles()
-except ImportError:  # older hosted snapshots may not include the local owner config helper
-    hidden_profile_keys = set()
-    name_key = lambda owner: str(owner).casefold()
-profile_owners = [owner for owner in owners if name_key(owner) not in hidden_profile_keys]
 POSITIONS = ["QB", "RB", "WR", "TE", "K", "D/ST"]
 DATA_VERSION = db.db_path().stat().st_mtime  # changes after every sync, which refreshes cached results
 
@@ -453,7 +429,7 @@ elif page == PAGE_EXPLORE:  # ---- guided questions, no AI, free
         st.error(f"Query failed: {e}")
 
 elif page == PAGE_PROFILE:  # ---- Owner profile
-    owner = st.selectbox("Owner", profile_owners, key="prof_owner")
+    owner = st.selectbox("Owner", owners, key="prof_owner")
     st.caption("Regular season, for the leagues and seasons selected in the sidebar. "
                "Choose All leagues and All seasons for a full career.")
     cs = insights.career_summary(con, owner, league_id, season_filter)
@@ -607,11 +583,9 @@ elif page == PAGE_RECORDS:  # ---- Records & streaks
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Most weeks as top scorer")
-            st.caption("💀 marks owners who have never been the top scorer in the selected league and seasons.")
             table(rb["top_scorer_weeks"], "top_scorer_weeks")
         with c2:
             st.subheader("Most weeks as lowest scorer")
-            st.caption("👑 marks owners who have never been the lowest scorer in the selected league and seasons.")
             table(rb["low_scorer_weeks"], "low_scorer_weeks")
         st.subheader(f"Highest single-game scores (top {limit})")
         table(rb["highest_scores"], "highest_scores")
