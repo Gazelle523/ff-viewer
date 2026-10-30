@@ -1,6 +1,7 @@
 """SQLite storage: tables for raw ESPN data plus views that make analysis (and LLM-written SQL) easy."""
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 DEFAULT_DB = Path(__file__).parent / "data" / "fantasy.db"
@@ -40,15 +41,25 @@ CREATE TABLE IF NOT EXISTS lineup_entries (
 VIEWS = """
 DROP VIEW IF EXISTS games;
 CREATE VIEW games AS
-WITH both_sides AS (
+WITH uniq AS (
+    -- Skip any matchup that exactly repeats an earlier week (same two teams, same scores). ESPN repeats the final
+    -- week for every week number after a season ends; this keeps those copies out of every game table.
+    SELECT m.* FROM matchups m
+    WHERE NOT EXISTS (
+        SELECT 1 FROM matchups p
+        WHERE p.league_id = m.league_id AND p.season = m.season AND p.week < m.week
+          AND p.home_team_id = m.home_team_id AND p.away_team_id = m.away_team_id
+          AND p.home_score = m.home_score AND p.away_score = m.away_score)
+),
+both_sides AS (
     SELECT league_id, season, week, is_regular_season,
            home_team_id AS team_id, away_team_id AS opp_team_id,
            home_score AS points_for, away_score AS points_against
-    FROM matchups
+    FROM uniq
     UNION ALL
     SELECT league_id, season, week, is_regular_season,
            away_team_id, home_team_id, away_score, home_score
-    FROM matchups
+    FROM uniq
 )
 SELECT b.league_id, l.name AS league_name, b.season, b.week, b.is_regular_season,
        b.team_id, t.team_name, t.owner,
@@ -131,3 +142,62 @@ def schema_text(con: sqlite3.Connection) -> str:
         "AND name NOT LIKE 'sqlite_%' ORDER BY type DESC, name"
     ).fetchall()
     return "\n\n".join(f"-- {t}: {n}\n{sql};" for t, n, sql in rows)
+
+
+def log_repair(con: sqlite3.Connection, message: str) -> None:
+    """Keep a short history of anything the cleanup removed (shown on the Data check page)."""
+    row = con.execute("SELECT value FROM meta WHERE key = 'repair_log'").fetchone()
+    lines = row[0].split("\n") if row and row[0] else []
+    lines.append(f"{datetime.now().strftime('%Y-%m-%d %H:%M')}  {message}")
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('repair_log', ?)", ("\n".join(lines[-50:]),))
+
+
+def get_repair_log(con: sqlite3.Connection) -> list:
+    row = con.execute("SELECT value FROM meta WHERE key = 'repair_log'").fetchone()
+    return row[0].split("\n") if row and row[0] else []
+
+
+def _lineup_signature(con, lid, sn, wk):
+    return frozenset(con.execute(
+        "SELECT team_id, player_id, points FROM lineup_entries WHERE league_id = ? AND season = ? AND week = ?",
+        (lid, sn, wk)))
+
+
+def find_duplicate_weeks(con: sqlite3.Connection) -> list:
+    """Weeks that are exact copies of the week before them. After a season ends, ESPN repeats the final week
+    for every later week number. A week only counts as a copy if the matchups, the scores AND (when both weeks
+    have them) every player's points are identical, so two real weeks are never mistaken for copies."""
+    sigs = {}
+    for lid, sn, wk, h, a, hs, as_ in con.execute(
+            "SELECT league_id, season, week, home_team_id, away_team_id, home_score, away_score FROM matchups"):
+        sigs.setdefault((lid, sn), {}).setdefault(wk, set()).add((h, a, hs, as_))
+    found = []
+    for (lid, sn), weeks in sigs.items():
+        ordered = sorted(weeks)
+        for prev, cur in zip(ordered, ordered[1:]):
+            if weeks[cur] != weeks[prev]:
+                continue
+            before, after = _lineup_signature(con, lid, sn, prev), _lineup_signature(con, lid, sn, cur)
+            if before and after and before != after:
+                continue  # same totals but different player scores: two real weeks
+            found.append({"league_id": lid, "season": sn, "repeats_week": prev, "from_week": cur,
+                          "weeks": [w for w in ordered if w >= cur]})
+            break
+    return found
+
+
+def repair_duplicate_weeks(con: sqlite3.Connection) -> int:
+    """Delete the copied weeks found above and log what was removed. Returns the number of weeks removed."""
+    removed = 0
+    for d in find_duplicate_weeks(con):
+        row = con.execute("SELECT name FROM leagues WHERE league_id = ? AND season = ?",
+                          (d["league_id"], d["season"])).fetchone()
+        for table in ("matchups", "lineup_entries"):
+            con.execute(f"DELETE FROM {table} WHERE league_id = ? AND season = ? AND week >= ?",
+                        (d["league_id"], d["season"], d["from_week"]))
+        removed += len(d["weeks"])
+        log_repair(con, f"Removed week(s) {d['weeks'][0]}-{d['weeks'][-1]} of {d['season']} for "
+                        f"{row[0] if row else d['league_id']}: identical to week {d['repeats_week']}")
+    if removed:
+        con.commit()
+    return removed

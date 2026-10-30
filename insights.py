@@ -3,11 +3,41 @@
 Every function takes an open sqlite connection and returns pandas DataFrames (or a dict of them).
 league_id / season = None means "all". Regular season only unless stated otherwise.
 """
+import os
+
 import numpy as np
 import pandas as pd
 
 PYTHAG_EXPONENT = 2.37  # commonly used for football; tweak if you like
 TEAM_WEEK = ["league_id", "season", "week", "team_id"]
+
+
+# ---------------------------------------------------------------- ESPN box score links
+# Best-known format of ESPN's matchup page. If it ever opens the wrong page, set ESPN_BOXSCORE_URL in .env to a
+# working link using the placeholders {league_id} {season} {week} {team_id} (see the README).
+DEFAULT_BOX_SCORE_URL = ("https://fantasy.espn.com/football/boxscore?leagueId={league_id}&matchupPeriodId={week}"
+                         "&scoringPeriodId={week}&seasonId={season}&teamId={team_id}&view=scoringperiod")
+LINK_KEYS = ["league_id", "season", "week", "team_id"]
+
+
+def box_score_url(league_id, season, week, team_id):
+    """Link to ESPN's page for one team's matchup (either team of a game opens the same game)."""
+    try:
+        template = os.getenv("ESPN_BOXSCORE_URL") or DEFAULT_BOX_SCORE_URL
+        return template.format(league_id=int(league_id), season=int(season), week=int(week), team_id=int(team_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def add_box_score_links(df):
+    """If a table has league_id, season, week and team_id columns, replace the two id columns with a box_score link."""
+    if df is None or df.empty or not all(c in df.columns for c in LINK_KEYS):
+        return df
+    out = df.copy()
+    links = [box_score_url(*row) for row in zip(out["league_id"], out["season"], out["week"], out["team_id"])]
+    out = out.drop(columns=["league_id", "team_id"])
+    out.insert(0, "box_score", links)  # first column, so it's visible without scrolling sideways
+    return out
 
 
 # ---------------------------------------------------------------- loading helpers
@@ -20,9 +50,10 @@ def _where(league_id=None, season=None, week=None, extra=()):
     if league_id:
         clauses.append("league_id = ?")
         params.append(int(league_id))
-    if season:
-        clauses.append("season = ?")
-        params.append(int(season))
+    if season:  # one season, or several (a tuple/list), e.g. "last 3 seasons"
+        picked = [season] if isinstance(season, (int, np.integer)) else list(season)
+        clauses.append("season IN (%s)" % ", ".join("?" * len(picked)))
+        params.extend(int(s) for s in picked)
     if week:
         clauses.append("week = ?")
         params.append(int(week))
@@ -112,7 +143,7 @@ def summarize_efficiency(e: pd.DataFrame, by_season=False) -> pd.DataFrame:
     return s.sort_values("efficiency_pct", ascending=False).reset_index(drop=True)
 
 
-REGRET_COLS = ["league_name", "season", "week", "owner", "benched", "benched_pos", "benched_points",
+REGRET_COLS = ["league_id", "team_id", "league_name", "season", "week", "owner", "benched", "benched_pos", "benched_points",
                "started", "started_slot", "started_points", "points_lost"]
 
 
@@ -130,6 +161,7 @@ def start_sit_regrets(con, league_id=None, season=None) -> pd.DataFrame:
                 continue
             b = cand.loc[cand["points"].idxmax()]
             rows.append({
+                "league_id": s.league_id, "team_id": s.team_id,
                 "league_name": s.league_name, "season": s.season, "week": s.week, "owner": s.owner,
                 "benched": b["player_name"], "benched_pos": b["position"], "benched_points": b["points"],
                 "started": s.player_name, "started_slot": s.slot, "started_points": s.points,
@@ -255,23 +287,33 @@ def streaks(con, league_id=None, season=None) -> pd.DataFrame:
 
 
 def records_book(con, league_id=None, season=None, limit=10) -> dict:
-    g = games(con, league_id, season)
+    """Single-game records across every game: regular season, playoffs and consolation (the stage and week columns
+    say which). The weeks-as-top/lowest-scorer counts use the regular season only (playoff weeks have fewer teams)."""
+    g = games(con, league_id, season, regular_only=False)
     if g.empty:
         return {}
-    cols = ["league_name", "season", "week", "owner", "team_name", "points_for", "points_against"]
     key = ["league_id", "season", "week"]
-    top = g.loc[g.groupby(key)["points_for"].idxmax()]
-    low = g.loc[g.groupby(key)["points_for"].idxmin()]
+    g = g.rename(columns={"opp_owner": "opponent", "opp_team_name": "opponent_team"})
+    g["stage"] = np.where(g["is_regular_season"] == 1, "Regular season", "Playoffs")
+    score_cols = ["league_id", "team_id", "league_name", "season", "week", "stage", "owner", "team_name",
+                  "points_for", "opponent", "opponent_team", "points_against"]
+    reg = g[g["is_regular_season"] == 1]
+    top = reg.loc[reg.groupby(key)["points_for"].idxmax()] if not reg.empty else reg
+    low = reg.loc[reg.groupby(key)["points_for"].idxmin()] if not reg.empty else reg
     wins = g[g["win"] == 1].copy()
     wins["margin"] = (wins["points_for"] - wins["points_against"]).round(1)
-    margin_cols = ["league_name", "season", "week", "owner", "opp_owner", "points_for", "points_against", "margin"]
+    wins = wins.rename(columns={"owner": "winner", "team_name": "winner_team", "opponent": "loser",
+                                "opponent_team": "loser_team", "points_for": "winner_score",
+                                "points_against": "loser_score"})
+    margin_cols = ["league_id", "team_id", "league_name", "season", "week", "stage", "winner", "winner_team",
+                   "winner_score", "loser", "loser_team", "loser_score", "margin"]
     return {
         "top_scorer_weeks": top.groupby("owner").size().rename("weeks_as_top_scorer")
                                .sort_values(ascending=False).reset_index(),
         "low_scorer_weeks": low.groupby("owner").size().rename("weeks_as_low_scorer")
                                .sort_values(ascending=False).reset_index(),
-        "highest_scores": g.nlargest(limit, "points_for")[cols].reset_index(drop=True),
-        "lowest_scores": g.nsmallest(limit, "points_for")[cols].reset_index(drop=True),
+        "highest_scores": g.nlargest(limit, "points_for")[score_cols].reset_index(drop=True),
+        "lowest_scores": g.nsmallest(limit, "points_for")[score_cols].reset_index(drop=True),
         "blowouts": wins.nlargest(limit, "margin")[margin_cols].reset_index(drop=True),
         "closest": wins[wins["margin"] > 0].nsmallest(limit, "margin")[margin_cols].reset_index(drop=True),
     }
@@ -317,13 +359,14 @@ def loyal_players(con, league_id=None, season=None, min_seasons=2) -> pd.DataFra
     return t.sort_values("weeks_started", ascending=False).reset_index(drop=True)
 
 
-def owner_top_players(con, owner, limit=10) -> pd.DataFrame:
-    return _q(con, """
+def owner_top_players(con, owner, limit=10, league_id=None, season=None) -> pd.DataFrame:
+    where, params = _where(league_id, season, extra=["owner = ?", "is_starter = 1"])
+    return _q(con, f"""
         SELECT player_name, position, COUNT(*) AS weeks_started,
                ROUND(SUM(points), 1) AS total_points, ROUND(AVG(points), 2) AS avg_points
-        FROM player_games WHERE owner = ? AND is_starter = 1
+        FROM player_games{where}
         GROUP BY league_id, player_id, player_name, position
-        ORDER BY total_points DESC LIMIT ?""", (owner, int(limit)))
+        ORDER BY total_points DESC LIMIT ?""", [owner] + params + [int(limit)])
 
 
 # ---------------------------------------------------------------- power rankings and time series
@@ -378,8 +421,9 @@ def weekly_scores(con, league_id, season) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- owner profile
-def career_summary(con, owner):
-    g = _q(con, "SELECT * FROM weekly_results WHERE is_regular_season = 1 AND owner = ?", (owner,))
+def career_summary(con, owner, league_id=None, season=None):
+    where, params = _where(league_id, season, extra=["is_regular_season = 1", "owner = ?"])
+    g = _q(con, f"SELECT * FROM weekly_results{where}", [owner] + params)
     if g.empty:
         return None
     g["luck"] = g["win"] - g["expected_win"]
@@ -394,3 +438,165 @@ def career_summary(con, owner):
                "win_pct": wins / games_n, "ppg": float(g["points_for"].mean()), "luck": float(g["luck"].sum()),
                "best_week": float(g["points_for"].max()), "worst_week": float(g["points_for"].min())}
     return {"overall": overall, "by_season": by}
+
+
+# ---------------------------------------------------------------- home page helpers
+def standings(con, league_id, season) -> pd.DataFrame:
+    """Regular-season standings: wins, then points for."""
+    g = games(con, league_id, season)
+    if g.empty:
+        return pd.DataFrame()
+    g["luck"] = g["win"] - g["expected_win"]
+    t = g.groupby("team_id").agg(owner=("owner", "last"), team=("team_name", "last"), games=("win", "count"),
+                                 wins=("win", "sum"), pf=("points_for", "sum"), pa=("points_against", "sum"),
+                                 luck=("luck", "sum")).reset_index(drop=True)
+    t = t.sort_values(["wins", "pf"], ascending=False).reset_index(drop=True)
+    t["record"] = t.apply(lambda r: f"{r['wins']:g}-{r['games'] - r['wins']:g}", axis=1)
+    t["ppg"] = (t["pf"] / t["games"]).round(1)
+    t["pf"], t["pa"], t["luck"] = t["pf"].round(1), t["pa"].round(1), t["luck"].round(2)
+    t.insert(0, "rank", range(1, len(t) + 1))
+    return t[["rank", "owner", "team", "record", "pf", "pa", "ppg", "luck"]]
+
+
+def latest_results(con, league_id, season):
+    """(week, is_regular_season, DataFrame) for the most recent week stored for this league-season."""
+    row = con.execute("SELECT MAX(week) FROM matchups WHERE league_id = ? AND season = ?",
+                      (int(league_id), int(season))).fetchone()
+    if not row or row[0] is None:
+        return None, None, pd.DataFrame()
+    week = int(row[0])
+    raw = _q(con, """
+        SELECT m.is_regular_season AS reg, m.league_id, m.season, m.week, m.home_team_id AS team_id,
+               th.owner AS home, m.home_score, ta.owner AS away, m.away_score
+        FROM matchups m
+        JOIN teams th ON th.league_id = m.league_id AND th.season = m.season AND th.team_id = m.home_team_id
+        JOIN teams ta ON ta.league_id = m.league_id AND ta.season = m.season AND ta.team_id = m.away_team_id
+        WHERE m.league_id = ? AND m.season = ? AND m.week = ?""", (int(league_id), int(season), week))
+    if raw.empty:
+        return week, None, raw
+    home_won = raw["home_score"] >= raw["away_score"]
+    out = pd.DataFrame({
+        "winner": raw["home"].where(home_won, raw["away"]),
+        "winner_score": raw["home_score"].where(home_won, raw["away_score"]),
+        "loser": raw["away"].where(home_won, raw["home"]),
+        "loser_score": raw["away_score"].where(home_won, raw["home_score"])})
+    out["margin"] = (out["winner_score"] - out["loser_score"]).round(1)
+    for c in LINK_KEYS:
+        out[c] = raw[c]
+    return week, bool(raw["reg"].iloc[0]), out.sort_values("margin", ascending=False).reset_index(drop=True)
+
+
+def possible_duplicate_owners(con) -> pd.DataFrame:
+    """Owner names that may be the same person: near-identical spelling, or the same last name with
+    first names that look like nicknames (Doug/Douglas, Rick/Ricky)."""
+    from difflib import SequenceMatcher
+    names = [r[0] for r in con.execute("SELECT DISTINCT owner FROM teams WHERE owner IS NOT NULL ORDER BY owner")]
+    rows = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            ta, tb = a.casefold().split(), b.casefold().split()
+            reason = None
+            if SequenceMatcher(None, "".join(ta), "".join(tb)).ratio() >= 0.88:
+                reason = "very similar spelling"
+            elif (len(ta) >= 2 and len(tb) >= 2 and ta[-1] == tb[-1] and len(ta[-1]) >= 3
+                  and (ta[0].startswith(tb[0]) or tb[0].startswith(ta[0]))):
+                reason = "same last name, first names look like nicknames"
+            if reason:
+                rows.append({"owner_a": a, "owner_b": b, "why": reason})
+    return pd.DataFrame(rows, columns=["owner_a", "owner_b", "why"])
+
+
+# ---------------------------------------------------------------- data check
+def data_coverage(con) -> pd.DataFrame:
+    """What is actually stored for each league-season: weeks, playoff weeks, lineups, top score."""
+    m = _q(con, """
+        SELECT l.name AS league, m.league_id, m.season, l.reg_season_weeks AS regular_season_length,
+               COUNT(DISTINCT m.week) AS weeks_stored, MIN(m.week) AS first_week, MAX(m.week) AS last_week,
+               COUNT(DISTINCT CASE WHEN m.is_regular_season = 1 THEN m.week END) AS regular_weeks,
+               COUNT(DISTINCT CASE WHEN m.is_regular_season = 0 THEN m.week END) AS playoff_weeks,
+               COUNT(*) AS games, ROUND(MAX(MAX(m.home_score, m.away_score)), 1) AS top_score
+        FROM matchups m JOIN leagues l ON l.league_id = m.league_id AND l.season = m.season
+        GROUP BY l.name, m.league_id, m.season, l.reg_season_weeks""")
+    lw = _q(con, "SELECT league_id, season, COUNT(DISTINCT week) AS weeks_with_lineups "
+                 "FROM lineup_entries GROUP BY league_id, season")
+    out = m.merge(lw, on=["league_id", "season"], how="left")
+    out["weeks_with_lineups"] = out["weeks_with_lineups"].fillna(0).astype(int)
+    return (out.drop(columns=["league_id"]).sort_values(["league", "season"], ascending=[True, False])
+               .reset_index(drop=True))
+
+
+def find_games(con, owner, opponent=None, league_id=None, season=None, limit=300) -> pd.DataFrame:
+    """Every stored game for an owner (optionally against one opponent), regular season and playoffs."""
+    extra, params = ["owner = ?"], [owner]
+    if opponent:
+        extra.append("opp_owner = ?")
+        params.append(opponent)
+    where, more = _where(league_id, season, extra=extra)
+    return _q(con, f"""
+        SELECT league_id, team_id, league_name, season, week,
+               CASE WHEN is_regular_season = 1 THEN 'Regular season' ELSE 'Playoffs' END AS stage,
+               owner, points_for, opp_owner AS opponent, points_against
+        FROM games{where} ORDER BY season DESC, week DESC LIMIT ?""", params + more + [int(limit)])
+
+
+# ---------------------------------------------------------------- in-app box score
+SLOT_ORDER = ["QB", "RB", "WR", "TE", "RB/WR/TE", "FLEX", "WR/TE", "RB/WR", "OP", "D/ST", "K",
+              "DT", "DE", "LB", "DL", "CB", "S", "DB", "DP"]
+SLOT_LABEL = {"RB/WR/TE": "FLEX", "WR/TE": "W/T", "RB/WR": "R/W", "BE": "Bench"}
+
+
+def _slot_rank(slot):
+    if slot == "BE":
+        return 90
+    if slot == "IR":
+        return 99
+    return SLOT_ORDER.index(slot) if slot in SLOT_ORDER else 50
+
+
+def box_score(con, league_id, season, week, team_id):
+    """Everything needed to show one game: both teams, scores and full lineups from the stored data.
+    Returns None if the game isn't stored."""
+    key = (int(league_id), int(season), int(week))
+    m = con.execute("SELECT home_team_id, away_team_id, home_score, away_score, is_regular_season FROM matchups "
+                    "WHERE league_id = ? AND season = ? AND week = ? AND (home_team_id = ? OR away_team_id = ?)",
+                    key + (int(team_id), int(team_id))).fetchone()
+    if not m:
+        return None
+    home, away, home_score, away_score, regular = m
+    info = {r[0]: (r[1], r[2]) for r in con.execute(
+        "SELECT team_id, team_name, owner FROM teams WHERE league_id = ? AND season = ?", key[:2])}
+    league = con.execute("SELECT name FROM leagues WHERE league_id = ? AND season = ?", key[:2]).fetchone()
+
+    sides = []
+    for tid, score in ((home, home_score), (away, away_score)):
+        lu = _q(con, "SELECT slot, is_starter, player_name AS player, position AS pos, nfl_team AS nfl, points "
+                     "FROM lineup_entries WHERE league_id = ? AND season = ? AND week = ? AND team_id = ?",
+                key + (int(tid),))
+        side = {"team_id": tid, "team": info.get(tid, ("?", "?"))[0], "owner": info.get(tid, ("?", "?"))[1],
+                "score": float(score), "lineup": pd.DataFrame(), "starters_total": None, "bench_total": None,
+                "best_possible": None, "efficiency": None, "points_missing": False}
+        if not lu.empty:
+            lu["points"] = lu["points"].fillna(0.0)
+            started = lu["is_starter"] == 1
+            usable = lu[lu["slot"] != "IR"]
+            side["starters_total"] = round(float(lu.loc[started, "points"].sum()), 1)
+            side["bench_total"] = round(float(lu.loc[lu["slot"] == "BE", "points"].sum()), 1)
+            best = max(side["starters_total"], _best_lineup(lu.loc[started, "slot"].tolist(),
+                                                            list(zip(usable["pos"], usable["points"]))))
+            side["best_possible"] = round(best, 1)
+            side["efficiency"] = round(side["starters_total"] / best * 100, 1) if best else 100.0
+            side["points_missing"] = bool(side["starters_total"] == 0 and float(score) > 0)  # ESPN's 0.0 issue
+            lu["_rank"] = lu["slot"].map(_slot_rank)
+            lu = lu.sort_values("_rank", kind="stable")
+            lu["slot"] = lu["slot"].map(lambda x: SLOT_LABEL.get(x, x))
+            side["lineup"] = lu[["slot", "player", "pos", "nfl", "points"]].reset_index(drop=True)
+        sides.append(side)
+
+    if home_score == away_score:
+        winner = "Tie"
+    else:
+        winner = sides[0]["owner"] if home_score > away_score else sides[1]["owner"]
+    return {"league_name": league[0] if league else "", "season": key[1], "week": key[2],
+            "stage": "Regular season" if regular else "Playoffs", "sides": sides, "winner": winner,
+            "margin": round(abs(float(home_score) - float(away_score)), 1),
+            "espn_url": box_score_url(key[0], key[1], key[2], team_id)}

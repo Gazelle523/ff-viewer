@@ -1,20 +1,16 @@
 """Ready-made analytics. Each function returns a pandas DataFrame."""
 import pandas as pd
 
+from insights import _where
+
 
 def q(con, sql: str, params=()) -> pd.DataFrame:
     return pd.read_sql_query(sql, con, params=params)
 
 
 def _filters(season=None, league_id=None, extra=None):
-    clauses, params = list(extra or []), []
-    if season:
-        clauses.append("season = ?")
-        params.append(season)
-    if league_id:
-        clauses.append("league_id = ?")
-        params.append(league_id)
-    return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+    """WHERE clause for league/season filters. season may be None, one season, or several."""
+    return _where(league_id, season, extra=list(extra or []))
 
 
 def luck(con, season=None, league_id=None) -> pd.DataFrame:
@@ -30,9 +26,9 @@ def luck(con, season=None, league_id=None) -> pd.DataFrame:
         ORDER BY luck DESC""", params)
 
 
-def luck_by_owner(con, league_id=None) -> pd.DataFrame:
-    """Career luck per owner across all seasons (and leagues, unless filtered)."""
-    where, params = _filters(None, league_id, ["is_regular_season = 1"])
+def luck_by_owner(con, league_id=None, season=None) -> pd.DataFrame:
+    """Luck per owner across the chosen leagues and seasons."""
+    where, params = _filters(season, league_id, ["is_regular_season = 1"])
     return q(con, f"""
         SELECT owner, COUNT(*) AS games, SUM(win) AS wins,
                ROUND(SUM(expected_win), 2) AS expected_wins,
@@ -53,19 +49,15 @@ def schedule_strength(con, season=None, league_id=None) -> pd.DataFrame:
         ORDER BY opp_avg_ppg DESC""", params)
 
 
-def position_average(con, owner_like: str, position: str, since_season: int, starters_only=True) -> pd.DataFrame:
+def position_average(con, owner, position, season=None, league_id=None, starters_only=True) -> pd.DataFrame:
     """Average points per player-week for an owner's players at a position, by season."""
-    sql = """
+    extra = ["owner = ?", "position = ?"] + (["is_starter = 1"] if starters_only else [])
+    where, params = _filters(season, league_id, extra)
+    return q(con, f"""
         SELECT season, owner, position, COUNT(*) AS player_weeks,
-               ROUND(AVG(points), 2) AS avg_points,
-               ROUND(SUM(points) / COUNT(DISTINCT week || '-' || league_id), 2) AS points_per_team_week
-        FROM player_games
-        WHERE owner LIKE ? AND position = ? AND season >= ?"""
-    params = [f"%{owner_like}%", position.upper(), since_season]
-    if starters_only:
-        sql += " AND is_starter = 1"
-    sql += " GROUP BY season, owner, position ORDER BY owner, season"
-    return q(con, sql, params)
+               ROUND(AVG(points), 2) AS avg_points, ROUND(SUM(points), 1) AS total_points
+        FROM player_games{where}
+        GROUP BY season, owner, position ORDER BY season""", [owner, position.upper()] + params)
 
 
 def bench_points(con, season=None, league_id=None) -> pd.DataFrame:

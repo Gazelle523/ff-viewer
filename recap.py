@@ -32,6 +32,11 @@ def latest_week(con, league_id):
     return (season, row[0]) if row and row[0] else None
 
 
+def _link(row) -> str:
+    url = insights.box_score_url(row["league_id"], row["season"], row["week"], row["team_id"])
+    return f" ([box score]({url}))" if url else ""
+
+
 def build_recap(con, league_id, season, week) -> str:
     g = insights.games(con, league_id, season)
     w = g[g["week"] == week]
@@ -40,29 +45,29 @@ def build_recap(con, league_id, season, week) -> str:
     lines = [f"🏈 **{w['league_name'].iloc[0]}: {season} Week {week} recap**", ""]
 
     top, low = w.loc[w["points_for"].idxmax()], w.loc[w["points_for"].idxmin()]
-    lines.append(f"🔥 **Top score:** {top['owner']} ({top['team_name']}) with {top['points_for']:.1f}")
-    lines.append(f"🥶 **Low score:** {low['owner']} ({low['team_name']}) with {low['points_for']:.1f}")
+    lines.append(f"🔥 **Top score:** {top['owner']} ({top['team_name']}) with {top['points_for']:.1f}" + _link(top))
+    lines.append(f"🥶 **Low score:** {low['owner']} ({low['team_name']}) with {low['points_for']:.1f}" + _link(low))
 
     winners = w[w["win"] == 1].copy()
     if not winners.empty:
         winners["margin"] = winners["points_for"] - winners["points_against"]
         big, close = winners.loc[winners["margin"].idxmax()], winners.loc[winners["margin"].idxmin()]
-        lines.append(f"💥 **Blowout:** {big['owner']} beat {big['opp_owner']} by {big['margin']:.1f}")
-        lines.append(f"😬 **Nail-biter:** {close['owner']} edged {close['opp_owner']} by {close['margin']:.1f}")
+        lines.append(f"💥 **Blowout:** {big['owner']} beat {big['opp_owner']} by {big['margin']:.1f}" + _link(big))
+        lines.append(f"😬 **Nail-biter:** {close['owner']} edged {close['opp_owner']} by {close['margin']:.1f}" + _link(close))
         lucky = winners.loc[winners["expected_win"].idxmin()]
         lines.append(f"🍀 **Luckiest win:** {lucky['owner']} won with a score that would have beaten only "
-                     f"{lucky['expected_win'] * 100:.0f}% of the league")
+                     f"{lucky['expected_win'] * 100:.0f}% of the league" + _link(lucky))
     losers = w[w["win"] == 0]
     if not losers.empty:
         unlucky = losers.loc[losers["expected_win"].idxmax()]
         lines.append(f"💔 **Unluckiest loss:** {unlucky['owner']} scored {unlucky['points_for']:.1f} (beats "
-                     f"{unlucky['expected_win'] * 100:.0f}% of the league) and still lost to {unlucky['opp_owner']}")
+                     f"{unlucky['expected_win'] * 100:.0f}% of the league) and still lost to {unlucky['opp_owner']}" + _link(unlucky))
 
     eff = insights.lineup_efficiency(con, league_id, season, week)
     if not eff.empty:
         best, worst = eff.loc[eff["efficiency"].idxmax()], eff.loc[eff["points_lost"].idxmax()]
         lines.append(f"🧠 **Best manager:** {best['owner']} ({best['efficiency']:.0f}% of the best possible lineup)")
-        lines.append(f"🤦 **Biggest lineup miss:** {worst['owner']} left {worst['points_lost']:.1f} points on the bench")
+        lines.append(f"🤦 **Biggest lineup miss:** {worst['owner']} left {worst['points_lost']:.1f} points on the bench" + _link(worst))
 
     pr = insights.power_rankings(con, league_id, season, through_week=week)
     if not pr.empty:
