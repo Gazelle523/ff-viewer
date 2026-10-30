@@ -1,0 +1,11 @@
+{
+  "_note": "Each entry: the name to show, then other ESPN owner names that are the same person. Matching ignores capitalization, spaces and punctuation.",
+  "_hidden_profiles": ["Greg Lemcool", "ZOMBIE TEAM", "Teri Heisler"],
+  "_team_owner_overrides": [
+    {"league_id": 1962371912, "season": 2021, "team_name": "Team Heisler", "owner": "William Heisler"},
+    {"league_id": 1962371912, "season": 2021, "team_name": "Eliza's Buckeyes", "owner": "Brooke"},
+    {"league_id": 1962371912, "season": 2022, "team_name": "ImagineBeingBad Heisler", "owner": "William Heisler"}
+  ],
+  "T&T": ["Travis Reep", "Travis Riep"],
+  "ZOMBIE TEAM": ["Greg Lemcool"]
+}
