@@ -211,3 +211,42 @@ def trade_leaderboard(con, league_id=None, season=None):
         return result
     return result.sort_values(["rankable", "winner_edge", "date"], ascending=[False, False, False],
                               na_position="last").reset_index(drop=True)
+
+
+def owner_trade_rankings(board):
+    """Rank owners by average signed above-replacement edge across their graded trades."""
+    stats = defaultdict(lambda: {"trades": 0, "graded": 0, "wins": 0, "losses": 0, "ties": 0, "net": 0.0})
+    if board is None or board.empty:
+        return pd.DataFrame(columns=["rank", "trader", "trades", "graded", "record", "avg_net_edge"])
+
+    for row in board.itertuples(index=False):
+        a, b = row.side_a, row.side_b
+        stats[a]["trades"] += 1
+        stats[b]["trades"] += 1
+        if not row.rankable:
+            continue
+        edge_a = float(row.side_a_ppg) - float(row.side_b_ppg)
+        for owner, edge in ((a, edge_a), (b, -edge_a)):
+            s = stats[owner]
+            s["graded"] += 1
+            s["net"] += edge
+            if edge > 0:
+                s["wins"] += 1
+            elif edge < 0:
+                s["losses"] += 1
+            else:
+                s["ties"] += 1
+
+    rows = []
+    for owner, s in stats.items():
+        rows.append({
+            "trader": owner, "trades": s["trades"], "graded": s["graded"],
+            "record": f"{s['wins']}/{s['losses']}",
+            "avg_net_edge": round(s["net"] / s["graded"], 2) if s["graded"] else None,
+        })
+    result = pd.DataFrame(rows).sort_values(
+        ["avg_net_edge", "graded", "trades", "trader"],
+        ascending=[False, False, False, True], na_position="last"
+    ).reset_index(drop=True)
+    result.insert(0, "rank", range(1, len(result) + 1))
+    return result

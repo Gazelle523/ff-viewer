@@ -462,6 +462,32 @@ def render_trades(lid, lname):
     ranked["when"] = ranked.apply(
         lambda row: f"{int(row['season'])} week {int(row['trade_week'])}", axis=1
     )
+    trader_rankings = trade_analysis.owner_trade_rankings(board)
+    award_candidates = trader_rankings[trader_rankings["avg_net_edge"].notna()]
+    if not award_candidates.empty:
+        larceny = award_candidates.iloc[0]
+        fleeced = award_candidates.iloc[-1]
+        award_left, award_right = st.columns(2)
+        with award_left:
+            st.markdown("#### 🏴‍☠️ Grand Theft Larceny Monger")
+            st.markdown(f"**{larceny['trader']}**")
+            st.caption(f"Average: {larceny['avg_net_edge']:+.2f} above-replacement pts/player/week per graded trade · "
+                       f"{larceny['record']} W/L · {int(larceny['graded'])} graded of {int(larceny['trades'])} trades")
+        with award_right:
+            st.markdown("#### 🫠 Takes Their Clothes off A Lot")
+            st.markdown(f"**{fleeced['trader']}**")
+            st.caption(f"Average: {fleeced['avg_net_edge']:+.2f} above-replacement pts/player/week per graded trade · "
+                       f"{fleeced['record']} W/L · {int(fleeced['graded'])} graded of {int(fleeced['trades'])} trades")
+        st.caption("Awards use each trader's average signed edge across every graded trade. The table below ranks "
+                   "traders by that average; the cards show individual deals.")
+    st.subheader("Trader rankings")
+    st.caption("Average signed above-replacement edge per graded trade: positive means the trader came out ahead; "
+               "negative means the other side did. The record is wins/losses. Trades without enough "
+               "player scoring data are counted but excluded from the average.")
+    table(trader_rankings.rename(columns={
+        "rank": "Rank", "trader": "Trader", "trades": "Trades", "graded": "Graded",
+        "record": "Record (W/L)", "avg_net_edge": "Average win/loss per trade (pts/player/week)",
+    }), f"trader_rankings_{lid}")
     for _, trade in ranked.iterrows():
         try:
             panel = st.container(border=True)
