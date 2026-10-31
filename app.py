@@ -15,6 +15,7 @@ import insights
 import metrics
 import recap
 import sqlrun
+import trade_analysis
 
 load_dotenv()
 # The hosted copy for friends has no ingest.py, so it automatically becomes a read-only viewer
@@ -83,9 +84,10 @@ PAGE_HOME, PAGE_EXPLORE, PAGE_PROFILE = "🏠 Home", "🔎 Explore", "👤 Owner
 PAGE_POWER, PAGE_LUCK, PAGE_LINEUPS = "📈 Power rankings & charts", "🍀 Luck & schedule", "🧠 Lineup decisions"
 PAGE_H2H, PAGE_CONSIST, PAGE_POS = "⚔️ Head-to-head", "📊 Consistency", "🏈 Positions & players"
 PAGE_RECORDS, PAGE_RECAP = "📜 Records & streaks", "📰 Weekly recap"
+PAGE_TRADES = "🤝 Trade analyzer"
 PAGE_DATA, PAGE_SQL, PAGE_ASK = "🩺 Data check", "🧑‍💻 SQL", "💬 Ask (optional)"
 PAGES = [PAGE_HOME, PAGE_EXPLORE, PAGE_PROFILE, PAGE_POWER, PAGE_LUCK, PAGE_LINEUPS, PAGE_H2H,
-         PAGE_CONSIST, PAGE_POS, PAGE_RECORDS, PAGE_RECAP, PAGE_DATA, PAGE_SQL, PAGE_ASK]
+         PAGE_CONSIST, PAGE_POS, PAGE_RECORDS, PAGE_TRADES, PAGE_RECAP, PAGE_DATA, PAGE_SQL, PAGE_ASK]
 SINGLE_SEASON_PAGES = {PAGE_HOME, PAGE_POWER, PAGE_RECAP}  # these show one season at a time
 NO_FILTER_PAGES = {PAGE_SQL, PAGE_ASK}
 if VIEWER:  # the Ask page spends the owner's API credits, so the shared copy doesn't offer it
@@ -388,6 +390,89 @@ def render_recap(lid, lname):
     st.caption("To post recaps to Discord automatically after each sync, see the README.")
 
 
+def render_trades(lid, lname):
+    available = sorted((int(s) for s in league_seasons.loc[league_seasons["league_id"] == lid, "season"]),
+                       reverse=True)
+    selected = available if season_filter is None else [s for s in available if s in season_filter]
+    if not selected:
+        st.info(f"{lname} has no imported seasons in the selected filter.")
+        return
+
+    if not VIEWER:
+        st.caption("Import or refresh accepted ESPN trades for the selected seasons. This only adds trade history; "
+                   "weekly player scores still come from Sync.")
+        if st.button(f"Fetch trade history for {len(selected)} season(s)", key=f"trade_fetch_{lid}"):
+            from espn_api.football import League
+
+            with st.spinner("Fetching accepted trades and filling missing player details from ESPN..."):
+                total, warnings = 0, []
+                for year in selected:
+                    try:
+                        league = League(league_id=int(lid), year=int(year),
+                                        espn_s2=os.getenv("ESPN_S2"), swid=os.getenv("ESPN_SWID"))
+                        result = trade_analysis.sync_trade_history(con, league, year)
+                        total += result["trades"]
+                        warnings.extend(f"{year}: {message}" for message in result["warnings"])
+                    except Exception as exc:
+                        warnings.append(f"{year}: {type(exc).__name__}: {exc}")
+            st.success(f"Trade history refreshed: {total} accepted trades found across {len(selected)} season(s).")
+            if warnings:
+                st.warning("Some ESPN records could not be fully retrieved:\n\n" + "\n".join(warnings[:12]))
+    else:
+        st.caption("Trade history is included in this hosted snapshot. To add older or missing records, fetch them "
+                   "in the local app and publish a fresh snapshot.")
+
+    board = trade_analysis.trade_leaderboard(con, lid, season_filter)
+    clauses, params = ["league_id = ?"], [int(lid)]
+    if season_filter is not None:
+        picks = [int(season_filter)] if isinstance(season_filter, int) else [int(s) for s in season_filter]
+        clauses.append("season IN (" + ",".join("?" for _ in picks) + ")")
+        params.extend(picks)
+    filter_sql = " AND ".join(clauses)
+    total = con.execute(f"SELECT COUNT(*) FROM trade_history WHERE {filter_sql}", params).fetchone()[0]
+    itemized = con.execute(
+        f"SELECT COUNT(DISTINCT h.trade_id) FROM trade_history h JOIN trade_legs x "
+        f"ON x.league_id=h.league_id AND x.season=h.season AND x.trade_id=h.trade_id WHERE "
+        f"{filter_sql.replace('league_id', 'h.league_id').replace('season', 'h.season')}", params
+    ).fetchone()[0]
+    if not total:
+        st.info("No trade history is stored for these seasons yet. Use the fetch button above, then refresh. "
+                "The analyzer will compare the players' fantasy points in scoring weeks after each trade.")
+        return
+    st.subheader(f"{lname}: trade results")
+    st.caption("Each acquired player's weekly score is compared with a replacement estimate: the average score of "
+               "the bottom quarter of that position's league starters in the same week. The grade adds each player's "
+               "average points above that baseline, so in a 2-for-1 the second player only adds value above replacement. "
+               "This is an estimate from stored lineups, not a projected waiver-wire score. The Trade column lists only "
+               "owners and players. Weeks when a player was not on a league roster are not observed.")
+    rankable = board[board["rankable"]] if not board.empty else board
+    st.caption(f"{int(total)} accepted trades · {int(itemized)} with player details · {len(rankable)} ranked")
+    if itemized < total:
+        st.warning(f"ESPN returned no recoverable player list for {total - itemized} trade(s); those records are not "
+                   "included in the rankings.")
+    if board.empty:
+        st.info("No trade player details could be analyzed for these seasons.")
+        return
+
+    ranked = board.sort_values(["rankable", "winner_edge", "date"],
+                               ascending=[False, False, False], na_position="last").copy()
+    ranked.insert(0, "rank", pd.NA)
+    ranked.loc[ranked["rankable"], "rank"] = range(1, len(rankable) + 1)
+    ranked["when"] = ranked.apply(
+        lambda row: f"{int(row['season'])} · {row['date']} · Wk {int(row['trade_week'])}", axis=1
+    )
+    table(ranked.rename(columns={
+        "rank": "Rank", "when": "When", "trade": "Trade",
+        "side_a_ppg": "Side A above-replacement PPG", "side_b_ppg": "Side B above-replacement PPG",
+        "winner": "Winner", "winner_edge": "Value edge / week",
+    })[["Rank", "When", "Trade", "Side A above-replacement PPG", "Side B above-replacement PPG",
+        "Winner", "Value edge / week"]], f"trade_results_{lid}")
+    unranked = int((~board["rankable"]).sum())
+    if unranked:
+        st.caption(f"{unranked} trade(s) are listed without a grade because a player return or post-trade scoring "
+                   "record is incomplete (for example, a deal involving FAAB).")
+
+
 # =====================================================================================
 if page == PAGE_HOME:  # ---- landing page
     st.caption("A snapshot of where each league stands. Pick a league and season in the sidebar.")
@@ -601,6 +686,9 @@ elif page == PAGE_RECORDS:  # ---- Records & streaks
 
 elif page == PAGE_RECAP:  # ---- Weekly recap
     per_league(render_recap)
+
+elif page == PAGE_TRADES:  # ---- Trade analyzer
+    per_league(render_trades)
 
 elif page == PAGE_DATA:  # ---- Data check
     st.caption("Check what is actually stored, find a specific game, and see anything the cleanup removed.")

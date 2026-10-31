@@ -35,6 +35,17 @@ CREATE TABLE IF NOT EXISTS lineup_entries (
     slot TEXT, is_starter INTEGER, points REAL,
     PRIMARY KEY (league_id, season, week, team_id, player_id)
 );
+CREATE TABLE IF NOT EXISTS trade_history (
+    league_id INTEGER, season INTEGER, trade_id TEXT,
+    accepted_at INTEGER, scoring_period INTEGER,
+    PRIMARY KEY (league_id, season, trade_id)
+);
+CREATE TABLE IF NOT EXISTS trade_legs (
+    league_id INTEGER, season INTEGER, trade_id TEXT,
+    player_id INTEGER, player_name TEXT,
+    from_team_id INTEGER, to_team_id INTEGER,
+    PRIMARY KEY (league_id, season, trade_id, player_id, from_team_id, to_team_id)
+);
 """
 
 # Views are dropped and recreated every time so definition changes always take effect.
