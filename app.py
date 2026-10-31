@@ -3,6 +3,7 @@ import hashlib
 import os
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
@@ -462,7 +463,38 @@ def render_trades(lid, lname):
     ranked["when"] = ranked.apply(
         lambda row: f"{int(row['season'])} week {int(row['trade_week'])}", axis=1
     )
-    trader_rankings = trade_analysis.owner_trade_rankings(board)
+    owner_ranker = getattr(trade_analysis, "owner_trade_rankings", None)
+    if owner_ranker is not None:
+        trader_rankings = owner_ranker(board)
+    else:
+        # Compatibility fallback for a hosted worker that still has an older cached module loaded.
+        stats = defaultdict(lambda: {"trades": 0, "graded": 0, "wins": 0, "losses": 0, "net": 0.0})
+        for trade in board.itertuples(index=False):
+            a, b = trade.side_a, trade.side_b
+            stats[a]["trades"] += 1
+            stats[b]["trades"] += 1
+            if not trade.rankable:
+                continue
+            edge_a = float(trade.side_a_ppg) - float(trade.side_b_ppg)
+            for owner, edge in ((a, edge_a), (b, -edge_a)):
+                s = stats[owner]
+                s["graded"] += 1
+                s["net"] += edge
+                s["wins" if edge > 0 else "losses"] += 1
+        rows = [{
+            "trader": owner, "trades": s["trades"], "graded": s["graded"],
+            "record": f"{s['wins']}/{s['losses']}",
+            "avg_net_edge": round(s["net"] / s["graded"], 2) if s["graded"] else None,
+        } for owner, s in stats.items()]
+        trader_rankings = pd.DataFrame(rows, columns=[
+            "trader", "trades", "graded", "record", "avg_net_edge",
+        ])
+        if not trader_rankings.empty:
+            trader_rankings = trader_rankings.sort_values(
+                ["avg_net_edge", "graded", "trades", "trader"],
+                ascending=[False, False, False, True], na_position="last"
+            ).reset_index(drop=True)
+            trader_rankings.insert(0, "rank", range(1, len(trader_rankings) + 1))
     award_candidates = trader_rankings[trader_rankings["avg_net_edge"].notna()]
     if not award_candidates.empty:
         larceny = award_candidates.iloc[0]
