@@ -1,6 +1,5 @@
 """Import accepted ESPN trades and compare acquired players' fantasy points after each deal."""
 import json
-import math
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -85,8 +84,8 @@ def trade_leaderboard(con, league_id=None, season=None):
 
     Only weeks strictly after the transaction scoring period count, avoiding partial-week credit.
     Player scores are looked up wherever that player appeared on a league roster in that week. A
-    player's rate is adjusted by the league's bottom-quartile starter score at that position for
-    the same week; the side's value is the sum of those player-level surpluses.
+    player's rate is adjusted by the best rostered player just beyond that position's weekly
+    starter cutoff; the side's value is the average of those player-level surpluses.
     """
     params, clauses = [], []
     if league_id:
@@ -120,17 +119,25 @@ def trade_leaderboard(con, league_id=None, season=None):
             scores[int(player_id)][int(week)] = float(points or 0)
             positions[(int(player_id), int(week))] = position
         starter_rows = con.execute(
-            "SELECT player_id,week,MAX(position),MAX(COALESCE(points,0)) FROM lineup_entries "
-            "WHERE league_id=? AND season=? AND is_starter=1 GROUP BY player_id,week", (lid, year)
+            "SELECT week,position,COUNT(DISTINCT player_id) FROM lineup_entries "
+            "WHERE league_id=? AND season=? AND is_starter=1 GROUP BY week,position", (lid, year)
         ).fetchall()
-        starter_points = defaultdict(list)
-        for _player_id, week, position, points in starter_rows:
+        starter_counts = {(int(week), str(position)): int(count)
+                          for week, position, count in starter_rows if position}
+        rostered_rows = con.execute(
+            "SELECT player_id,week,MAX(position),MAX(COALESCE(points,0)) FROM lineup_entries "
+            "WHERE league_id=? AND season=? AND COALESCE(slot,'')!='IR' GROUP BY player_id,week", (lid, year)
+        ).fetchall()
+        rostered_points = defaultdict(list)
+        for _player_id, week, position, points in rostered_rows:
             if position:
-                starter_points[(int(week), str(position))].append(float(points or 0))
+                rostered_points[(int(week), str(position))].append(float(points or 0))
         replacement = {}
-        for key, values in starter_points.items():
-            bottom_n = max(1, math.ceil(len(values) * 0.25))
-            replacement[key] = sum(sorted(values)[:bottom_n]) / bottom_n
+        for key, values in rostered_points.items():
+            cutoff = starter_counts.get(key)
+            ranked_scores = sorted(values, reverse=True)
+            if cutoff is not None and 0 <= cutoff < len(ranked_scores):
+                replacement[key] = ranked_scores[cutoff]
         team_names = {int(tid): (owner or "Unknown owner", name or "Unknown team")
                       for tid, name, owner in con.execute(
                           "SELECT team_id,team_name,owner FROM teams WHERE league_id=? AND season=?",
@@ -151,21 +158,24 @@ def trade_leaderboard(con, league_id=None, season=None):
             for player_id, player_name, sender, receiver in legs:
                 receiver = int(receiver)
                 above_replacement = []
+                raw_points = []
                 for week, points in scores.get(int(player_id), {}).items():
                     if week <= period:
                         continue
+                    raw_points.append(points)
                     position = positions.get((int(player_id), week))
                     replacement_points = replacement.get((week, str(position))) if position else None
                     if replacement_points is not None:
                         above_replacement.append(points - replacement_points)
-                assets[receiver].append((str(player_name), sum(above_replacement), len(above_replacement)))
+                raw_ppg = sum(raw_points) / len(raw_points) if raw_points else None
+                assets[receiver].append((str(player_name), sum(above_replacement), len(above_replacement), raw_ppg))
 
             a, b = participants[:2]
             has_assets = bool(assets[a]) and bool(assets[b])
             def team_value_ppg(team_id):
-                rates = [surplus / weeks for _, surplus, weeks in assets[team_id] if weeks]
+                rates = [surplus / weeks for _, surplus, weeks, _ in assets[team_id] if weeks]
                 complete = bool(assets[team_id]) and len(rates) == len(assets[team_id])
-                return (sum(rates), complete) if complete else (None, False)
+                return (sum(rates) / len(rates), complete) if complete else (None, False)
 
             a_ppg, a_complete = team_value_ppg(a)
             b_ppg, b_complete = team_value_ppg(b)
@@ -183,15 +193,13 @@ def trade_leaderboard(con, league_id=None, season=None):
             timestamp = int(accepted_at or 0)
             date = datetime.fromtimestamp(timestamp / 1000, timezone.utc).strftime("%Y-%m-%d") if timestamp else ""
 
-            def player_names(team_id):
-                return ", ".join(name for name, _, _ in assets[team_id]) or "No players recorded"
-
             owner_label = lambda team_id: team_names.get(team_id, ("Unknown owner", "Unknown team"))[0]
             side_a, side_b = owner_label(a), owner_label(b)
             output.append({
                 "league_id": lid, "league": league_name or str(lid), "season": year,
                 "date": date, "trade_week": period,
-                "trade": f"{side_a} received: {player_names(a)} · {side_b} received: {player_names(b)}",
+                "side_a_players": [(name, ppg) for name, _, _, ppg in assets[a]],
+                "side_b_players": [(name, ppg) for name, _, _, ppg in assets[b]],
                 "side_a": side_a, "side_a_ppg": round(a_ppg, 2) if a_ppg is not None else None,
                 "side_b": side_b, "side_b_ppg": round(b_ppg, 2) if b_ppg is not None else None,
                 "winner": verdict, "winner_edge": edge,

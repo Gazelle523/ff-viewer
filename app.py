@@ -440,11 +440,12 @@ def render_trades(lid, lname):
                 "The analyzer will compare the players' fantasy points in scoring weeks after each trade.")
         return
     st.subheader(f"{lname}: trade results")
-    st.caption("Each acquired player's weekly score is compared with a replacement estimate: the average score of "
-               "the bottom quarter of that position's league starters in the same week. The grade adds each player's "
-               "average points above that baseline, so in a 2-for-1 the second player only adds value above replacement. "
-               "This is an estimate from stored lineups, not a projected waiver-wire score. The Trade column lists only "
-               "owners and players. Weeks when a player was not on a league roster are not observed.")
+    st.caption("The PPG beside each received player is his actual fantasy points per scoring week after the trade week. "
+               "Each acquired player's weekly score is compared with a replacement estimate: the top rostered "
+               "player just beyond that position's starter cutoff in the same week. The cutoff is based on the number "
+               "of actual starters at that position. Each side's grade is its average above-replacement PPG per received "
+               "player, so package size does not decide the winner. This uses stored league rosters, not the full "
+               "waiver pool. Weeks when a player was not on a league roster are not observed.")
     rankable = board[board["rankable"]] if not board.empty else board
     st.caption(f"{int(total)} accepted trades · {int(itemized)} with player details · {len(rankable)} ranked")
     if itemized < total:
@@ -459,14 +460,59 @@ def render_trades(lid, lname):
     ranked.insert(0, "rank", pd.NA)
     ranked.loc[ranked["rankable"], "rank"] = range(1, len(rankable) + 1)
     ranked["when"] = ranked.apply(
-        lambda row: f"{int(row['season'])} · {row['date']} · Wk {int(row['trade_week'])}", axis=1
+        lambda row: f"{int(row['season'])} week {int(row['trade_week'])}", axis=1
     )
-    table(ranked.rename(columns={
-        "rank": "Rank", "when": "When", "trade": "Trade",
-        "side_a_ppg": "Side A above-replacement PPG", "side_b_ppg": "Side B above-replacement PPG",
-        "winner": "Winner", "winner_edge": "Value edge / week",
-    })[["Rank", "When", "Trade", "Side A above-replacement PPG", "Side B above-replacement PPG",
-        "Winner", "Value edge / week"]], f"trade_results_{lid}")
+    for _, trade in ranked.iterrows():
+        try:
+            panel = st.container(border=True)
+        except TypeError:
+            panel = st.container()
+        with panel:
+            heading = st.columns([2, 3])
+            rank_label = str(int(trade["rank"])) if pd.notna(trade["rank"]) else "—"
+            heading[0].markdown(f"**#{rank_label} · {trade['when']}**")
+            if trade["rankable"]:
+                heading[1].markdown(
+                    f"Winner: **{trade['winner']}** · edge **{trade['winner_edge']:.2f} above-replacement pts/player/week**"
+                )
+            else:
+                heading[1].markdown(f"Not graded: {trade['winner']}")
+            sides = st.columns(2)
+            for col, owner_key, received_key, points_key in (
+                (sides[0], "side_a", "side_a_players", "side_a_ppg"),
+                (sides[1], "side_b", "side_b_players", "side_b_ppg"),
+            ):
+                with col:
+                    st.markdown(f"**{trade[owner_key]}**")
+                    received = trade[received_key] or []
+                    st.markdown("**Received · post-trade PPG**")
+                    if received:
+                        for name, ppg in received:
+                            if pd.notna(ppg):
+                                st.markdown(f"- {name} — **{ppg:.1f} PPG**")
+                            else:
+                                st.markdown(f"- {name} — PPG unavailable")
+                    else:
+                        st.caption("No players recorded")
+                    value = trade[points_key]
+                    st.caption(f"Average above-replacement value: {value:+.2f} pts/player/week" if pd.notna(value)
+                               else "Average above-replacement value: unavailable")
+
+    export = ranked[["rank", "when", "side_a", "side_a_players", "side_a_ppg", "side_b", "side_b_players",
+                     "side_b_ppg", "winner", "winner_edge"]].copy()
+    def player_summary(players):
+        return "; ".join(f"{name} ({ppg:.1f} PPG)" if pd.notna(ppg) else f"{name} (PPG unavailable)"
+                          for name, ppg in (players or []))
+
+    export["side_a_players"] = export["side_a_players"].apply(player_summary)
+    export["side_b_players"] = export["side_b_players"].apply(player_summary)
+    export = export.rename(columns={"rank": "rank", "when": "trade", "side_a": "owner_a",
+                                    "side_a_players": "owner_a_received", "side_a_ppg": "owner_a_avg_above_replacement_ppg",
+                                    "side_b": "owner_b", "side_b_players": "owner_b_received",
+                                    "side_b_ppg": "owner_b_avg_above_replacement_ppg", "winner": "winner",
+                                    "winner_edge": "value_edge_per_week"})
+    st.download_button("⬇ Download trade rankings CSV", export.to_csv(index=False).encode("utf-8"),
+                       file_name=f"trade_results_{lid}.csv", mime="text/csv", key=f"dl_trade_results_{lid}")
     unranked = int((~board["rankable"]).sum())
     if unranked:
         st.caption(f"{unranked} trade(s) are listed without a grade because a player return or post-trade scoring "
